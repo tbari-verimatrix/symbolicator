@@ -1,0 +1,229 @@
+#!/usr/bin/ruby
+
+# Reference:
+#  https://developer.apple.com/documentation/xcode/adding-identifiable-symbol-names-to-a-crash-report
+
+require 'open3'
+
+def format_uuid( raw_uuid )
+    part1 = raw_uuid[0..7].upcase
+    part2 = raw_uuid[8..11].upcase
+    part3 = raw_uuid[12..15].upcase
+    part4 = raw_uuid[16..19].upcase
+    part5 = raw_uuid[20..31].upcase
+
+    return (part1 + "-" + part2 + "-" + part3 + "-" + part4 + "-" + part5)
+end
+
+def select_dSYM_for_binary( xcarchive_dir, binary_name, uuid )
+    options = Dir.glob( xcarchive_dir + "/dSYMs/*" ).select { |e| e.match(/.*\/dSYMs\/#{binary_name}.*\.dSYM/) }
+    options.each do |option|
+        if File::exist?(option + "/Contents/Resources/DWARF/#{binary_name}") then
+            output, state = Open3.capture2( "dwarfdump -uuid \"#{option}\"" )
+            if output.match(/#{uuid}/) then
+                return option
+            end
+        end
+    end
+    return nil
+ end
+
+def update_dSYM_for_binary_image( binary_image )
+
+    if binary_image[:dsym_file] != nil then
+        return
+    end
+
+    options, status = Open3.capture2( "mdfind \"com_apple_xcode_dsym_uuids == #{binary_image[:uuid]}\"" )
+    options.split("\n").each do |option|
+        result = select_dSYM_for_binary( option, binary_image[:binary_name], binary_image[:uuid] )
+        if result != nil then
+            binary_image[:dsym_file] = result
+
+            bcsymbolmap_file = option + "/BCSymbolMaps/#{binary_image[:uuid]}.bcsymbolmap"
+            if File.exist?( bcsymbolmap_file ) then
+                binary_image[:bcsymbolmap] = bcsymbolmap_file
+
+                if $config[:auto_symbolicate] then
+                    Open3.capture2( "dsymutil -symbol-map \"#{bcsymbolmap_file}\" \"#{result}\"" )
+                end
+            end
+
+            break
+        end
+    end
+
+end
+
+$config = {
+    :crashlog => "",
+    :only_crashed_thread => false,
+    :auto_symbolicate => false,
+    :help => false
+}
+
+def print_help()
+    print( "
+Usage:
+  $ #{$PROGRAM_NAME} crashlog_file_path [flags]
+
+  Flags:
+      -a, --auto-symbolicate : Automatically symbolicate dSYMs if the corresponding BCSymbolMap file can be found
+      -c, --only-crashed     : Show the callstack of the crashed thread only
+      -h, --help             : Show this message
+" )
+end
+
+def parse_arguments( argv )
+
+    if argv.size < 1 then
+        puts( "No argument(s) given!" )
+        return false
+    end
+
+    if !File.readable?( argv[0] ) then
+        print( "Input file [#{argv[0]}] is not readable!\n" )
+        return false
+    end
+    $config[:crashlog] = argv[0]
+
+    idx = 1
+    while idx < argv.size() do
+        if argv[idx] == "-c" || argv[idx] == "--only-crashed" then
+            $config[:only_crashed_thread] = true
+        elsif argv[idx] == "-h" || argv[idx] == "--help" then
+            $config[:help] = true
+        elsif argv[idx] == "-a" || argv[idx] == "--auto-symbolicate" then
+            $config[:auto_symbolicate] = true
+        end
+        idx += 1
+    end
+
+    return true
+end
+
+if !parse_arguments( ARGV ) then
+    print_help()
+    exit 1
+end
+
+if $config[:help] then
+    print_help()
+    exit 0
+end
+
+thread_callstack_header_pattern = /^Thread\s+(?<thread_num>\d+)(?<extra>\sCrashed)?:$/
+callstack_frame_pattern = /^(?<frame_num>\d+)\s+(?<binary_name>[\w\.]+)\s+(?<address>0x\h+)\s+(?<load_address>0x\h+)\s\+\s(?<offset>\d+)/
+binary_images_start_pattern = /Binary\sImages:/
+binary_image_info_pattern = /^(?<load_address>0x\h+)\s-\s0x\h+\s(?<binary_name>[^\s]+)\s(?<arch>[^\s]+)\s+<(?<uuid>\h{32})>/
+
+callstacks = []
+binary_images = []
+
+# States:
+# :Unkown
+# :InThreadCallstack
+# :InBinaryImageList
+state = :Unkown
+crashlog = File.readlines( $config[:crashlog] ).each do | line |
+
+    if( state == :InThreadCallstack ) then
+        matched = false
+        line.match(callstack_frame_pattern) { |matches|
+            matched = true
+            callstacks.last[:frames].append(
+                {   :frame_num => matches[:frame_num].to_i,
+                    :binary_name => matches[:binary_name],
+                    :address => matches[:address],
+                    :load_address => matches[:load_address],
+                    :offset => matches[:offset]
+                }
+            )
+        }
+
+        if !matched then
+            state = :Unkown
+        end
+    end
+
+    if( state == :InBinaryImageList ) then
+        matched = false
+        line.match(binary_image_info_pattern) { |matches|
+            matched = true
+            binary_images.append(
+                {   :load_address => matches[:load_address],
+                    :binary_name => matches[:binary_name],
+                    :arch => matches[:arch],
+                    :uuid => format_uuid( matches[:uuid] ),
+                    :dsym_file => nil,
+                    :bcsymbolmap => nil
+                }
+            )
+        }
+
+        if !matched then
+            state = :Unkown
+        end
+    end
+
+    if( state == :Unkown) then
+        matched = false
+        line.match(thread_callstack_header_pattern) { |matches|
+            matched = true
+            callstacks.append(
+                {   :thread_num => matches[:thread_num].to_i,
+                    :crashed => matches[:extra].to_s.end_with?( "Crashed" ),
+                    :frames => []
+                }
+            )
+            state = :InThreadCallstack
+        }
+
+        if !matched then
+            matched = false
+            line.match(binary_images_start_pattern) { |matches|
+                matched = true
+                state = :InBinaryImageList
+            }
+
+            if !matched then
+                state = :Unkown
+            end
+        end
+    end
+end
+
+load_address_to_binary_image = {}
+binary_images.each do | image |
+    load_address_to_binary_image[ image[:load_address] ] = image
+end
+
+number_of_bins = binary_images.size
+
+callstacks.each do | thread |
+    if !thread[:crashed] && $config[:only_crashed_thread] then
+        next
+    end
+
+    print( "\nThread #{thread[:thread_num]} #{thread[:crashed] ? "(crashed)" : ""}\n" )
+    thread[:frames].each do | frame |
+        load_address = frame[:load_address]
+        binary_image = load_address_to_binary_image[ load_address ]
+        update_dSYM_for_binary_image( binary_image )
+        if binary_image[:dsym_file] == nil then
+            print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{load_address} = #{frame[:address]} + #{frame[:offset]}\n" )
+        else
+            address = frame[:address]
+            dsym_loc = binary_image[ :dsym_file ]
+            arch = binary_image[:arch]
+            binary_name = binary_image[:binary_name]
+            atos_command = "atos -arch #{arch} -o \"#{dsym_loc}\" -l #{load_address}  #{ address }\n"
+            resolved, status = Open3.capture2( atos_command )
+            print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{resolved.strip}\n" )
+        end
+    end
+end
+
+# binary_images.each do |image|
+#     print( "#{image[:binary_name]}\n  dSYM: #{image[:dsym_file]}\n  BCSM: #{image[:bcsymbolmap]}\n" )
+# end
