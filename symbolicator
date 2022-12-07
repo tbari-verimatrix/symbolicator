@@ -5,6 +5,15 @@
 
 require 'open3'
 
+$config = {
+    :crashlog => "",
+    :xcarchive => nil,
+    :only_crashed_thread => false,
+    :auto_symbolicate => false,
+    :verbose => false,
+    :help => false
+}
+
 def format_uuid( raw_uuid )
     part1 = raw_uuid[0..7].upcase
     part2 = raw_uuid[8..11].upcase
@@ -28,17 +37,24 @@ def select_dSYM_for_binary( xcarchive_dir, binary_name, uuid )
     return nil
  end
 
-def update_dSYM_for_binary_image( binary_image )
+def update_dSYM_for_binary_image( binary_image, preferred_xcarchive )
 
-    if binary_image[:dsym_file] != nil then
+    if binary_image[:dsym_file_lookup_done] then
         return
     end
 
-    options, status = Open3.capture2( "mdfind \"com_apple_xcode_dsym_uuids == #{binary_image[:uuid]}\"" )
+    if preferred_xcarchive == nil then
+        options, status = Open3.capture2( "mdfind \"com_apple_xcode_dsym_uuids == #{binary_image[:uuid]}\"" )
+    else
+        options = preferred_xcarchive
+    end
+
+    success = false
     options.split("\n").each do |option|
         result = select_dSYM_for_binary( option, binary_image[:binary_name], binary_image[:uuid] )
         if result != nil then
             binary_image[:dsym_file] = result
+            success = true
 
             bcsymbolmap_file = option + "/BCSymbolMaps/#{binary_image[:uuid]}.bcsymbolmap"
             if File.exist?( bcsymbolmap_file ) then
@@ -53,24 +69,25 @@ def update_dSYM_for_binary_image( binary_image )
         end
     end
 
-end
+    if !success && preferred_xcarchive != nil then
+        update_dSYM_for_binary_image( binary_image, nil ) # retry with spotlight search
+    end
 
-$config = {
-    :crashlog => "",
-    :only_crashed_thread => false,
-    :auto_symbolicate => false,
-    :help => false
-}
+    binary_image[:dsym_file_lookup_done] = true
+end
 
 def print_help()
     print( "
 Usage:
-  $ #{$PROGRAM_NAME} crashlog_file_path [flags]
+  $ #{$PROGRAM_NAME} crashlog_file_path [options]
 
-  Flags:
-      -a, --auto-symbolicate : Automatically symbolicate dSYMs if the corresponding BCSymbolMap file can be found
-      -c, --only-crashed     : Show the callstack of the crashed thread only
-      -h, --help             : Show this message
+  Options:
+      -x <xcarchive-path>     : Prefer dSYM and BCSymbolMap files from this archive.
+      -a, --auto-symbolicate  : Automatically symbolicate dSYMs if
+                                the corresponding BCSymbolMap files can be found.
+      -c, --only-crashed      : Show the callstack of the crashed thread only.
+      -v, --verbose           : Print additional info (for now, the configuration)
+      -h, --help              : Show this message.
 " )
 end
 
@@ -79,6 +96,11 @@ def parse_arguments( argv )
     if argv.size < 1 then
         puts( "No argument(s) given!" )
         return false
+    end
+
+    if argv[0] == "-h" || argv[0] == "--help" then
+        $config[:help] = true
+        return true
     end
 
     if !File.readable?( argv[0] ) then
@@ -91,20 +113,47 @@ def parse_arguments( argv )
     while idx < argv.size() do
         if argv[idx] == "-c" || argv[idx] == "--only-crashed" then
             $config[:only_crashed_thread] = true
+            idx += 1
         elsif argv[idx] == "-h" || argv[idx] == "--help" then
             $config[:help] = true
+            idx += 1
         elsif argv[idx] == "-a" || argv[idx] == "--auto-symbolicate" then
             $config[:auto_symbolicate] = true
+            idx += 1
+        elsif argv[idx] == "-v" || argv[idx] == "--verbose" then
+            $config[:verbose] = true
+            idx += 1
+        elsif argv[idx] == "-x" then
+            possible_path = ( idx + 1 ) < argv.size() ? argv[ idx + 1 ] : ""
+            if !possible_path.empty? then
+                if Dir.exist?( possible_path ) then
+                    $config[:xcarchive] = possible_path
+                else
+                    print( "Xcarchive path cannot be found: #{ possible_path }\n" )
+                    return false
+                end
+            else
+                print( "Option '-x' needs an additional argument\n" )
+                return false
+            end
+            idx += 2
+        else
+            print( "Unrecognized option: #{argv[idx]}\n" )
+            idx += 1
         end
-        idx += 1
     end
-
     return true
 end
 
 if !parse_arguments( ARGV ) then
     print_help()
     exit 1
+end
+
+if $config[:verbose] then
+    $config.each { |key, value|
+        print( "#{key} : #{value}\n" );
+    }
 end
 
 if $config[:help] then
@@ -156,6 +205,7 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
                     :arch => matches[:arch],
                     :uuid => format_uuid( matches[:uuid] ),
                     :dsym_file => nil,
+                    :dsym_file_lookup_done => false,
                     :bcsymbolmap => nil
                 }
             )
@@ -209,7 +259,7 @@ callstacks.each do | thread |
     thread[:frames].each do | frame |
         load_address = frame[:load_address]
         binary_image = load_address_to_binary_image[ load_address ]
-        update_dSYM_for_binary_image( binary_image )
+        update_dSYM_for_binary_image( binary_image, $config[:xcarchive] )
         if binary_image[:dsym_file] == nil then
             print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{load_address} = #{frame[:address]} + #{frame[:offset]}\n" )
         else
