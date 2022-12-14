@@ -10,9 +10,17 @@ $config = {
     :xcarchive => nil,
     :only_crashed_thread => false,
     :auto_symbolicate => false,
+    :no_system_libs => false,
     :verbose => false,
     :help => false
 }
+
+callstacks = []
+binary_images = []
+os_version = nil
+system_architecture = nil
+triggering_thread = nil
+$system_symbols_path = nil
 
 def format_uuid( raw_uuid )
     part1 = raw_uuid[0..7].upcase
@@ -22,6 +30,17 @@ def format_uuid( raw_uuid )
     part5 = raw_uuid[20..31].upcase
 
     return (part1 + "-" + part2 + "-" + part3 + "-" + part4 + "-" + part5)
+end
+
+def update_dSYM_for_system_lib( binary_image )
+    if( $config[:no_system_libs] || $system_symbols_path == nil )
+        return
+    end
+
+    candidate = File.join( $system_symbols_path, binary_image[:path_on_device])
+    if( File.exist?( candidate ) )
+        binary_image[:dsym_file] = candidate
+    end
 end
 
 def select_dSYM_for_binary( xcarchive_dir, binary_name, uuid )
@@ -40,6 +59,12 @@ def select_dSYM_for_binary( xcarchive_dir, binary_name, uuid )
 def update_dSYM_for_binary_image( binary_image, preferred_xcarchive )
 
     if binary_image[:dsym_file_lookup_done] then
+        return
+    end
+
+    if( !binary_image[:included_in_bundle] ) # it's a system lib
+        update_dSYM_for_system_lib(binary_image)
+        binary_image[:dsym_file_lookup_done] = true
         return
     end
 
@@ -76,6 +101,30 @@ def update_dSYM_for_binary_image( binary_image, preferred_xcarchive )
     binary_image[:dsym_file_lookup_done] = true
 end
 
+def find_system_symbols_path( os_version )
+    device_support_dir_name = nil
+    if ( os_version[:name].include?( "iPhone OS" ) )
+        device_support_dir_name = "iOS DeviceSupport"
+    else
+        print( "OS version not supported yet: #{ os_version[:name] }" );
+    end
+
+    xcode_data_path = File.join( Dir.home, "Library", "Developer", "Xcode", device_support_dir_name )
+    if !Dir.exist?( xcode_data_path )
+        print( "Xcode data path cannot be found: #{xcode_data_path}\n" )
+        return nil
+    end
+
+    options = Dir.glob( File.join( xcode_data_path, "*" ) ).select { |e| e.match(/.*#{os_version[:id]}.*/) }
+    options.each do |option|
+        candidate = File.join( option, "Symbols" )
+        if( Dir.exist?( candidate ) )
+            return candidate
+        end
+    end
+    return nil
+end
+
 def print_help()
     print( "
 Usage:
@@ -86,6 +135,8 @@ Usage:
       -a, --auto-symbolicate  : Automatically symbolicate dSYMs if
                                 the corresponding BCSymbolMap files can be found.
       -c, --only-crashed      : Show the callstack of the crashed thread only.
+      -n, --no-system-libs    : Don't resolve frames for binaries that are
+                                not part of the application bundle.
       -v, --verbose           : Print additional info (for now, the configuration)
       -h, --help              : Show this message.
 " )
@@ -119,6 +170,9 @@ def parse_arguments( argv )
             idx += 1
         elsif argv[idx] == "-a" || argv[idx] == "--auto-symbolicate" then
             $config[:auto_symbolicate] = true
+            idx += 1
+        elsif argv[idx] == "-n" || argv[idx] == "--no-system-libs" then
+            $config[:no_system_libs] = true
             idx += 1
         elsif argv[idx] == "-v" || argv[idx] == "--verbose" then
             $config[:verbose] = true
@@ -154,6 +208,7 @@ if $config[:verbose] then
     $config.each { |key, value|
         print( "#{key} : #{value}\n" );
     }
+    puts( "" )
 end
 
 if $config[:help] then
@@ -161,13 +216,27 @@ if $config[:help] then
     exit 0
 end
 
+# Thread 0 Crashed:
+# Thread 1:
 thread_callstack_header_pattern = /^Thread\s+(?<thread_num>\d+)(?<extra>\sCrashed)?:$/
-callstack_frame_pattern = /^(?<frame_num>\d+)\s+(?<binary_name>[\w\.]+)\s+(?<address>0x\h+)\s+(?<load_address>0x\h+)\s\+\s(?<offset>\d+)/
-binary_images_start_pattern = /Binary\sImages:/
-binary_image_info_pattern = /^(?<load_address>0x\h+)\s-\s0x\h+\s(?<binary_name>[^\s]+)\s(?<arch>[^\s]+)\s+<(?<uuid>\h{32})>/
 
-callstacks = []
-binary_images = []
+# 5   Molecules_TBari_ed            	0x000000010134455c 0x101324000 + 132444
+callstack_frame_pattern = /^(?<frame_num>\d+)\s+(?<binary_name>[\w\.]+)\s+(?<address>0x\h+)\s+(?<load_address>0x\h+)\s\+\s(?<offset>\d+)/
+
+# Binary Images:
+binary_images_start_pattern = /Binary\sImages:/
+
+# 0x101324000 - 0x1014cbfff Molecules_TBari_ed arm64  <4c5eff7bc4d63c5a85917d0a5f39401b> /var/containers/Bundle/Application/6F4DBCC8-B5F0-4F96-B5AB-4282458D0B25/Molecules_TBari_ed.app/Molecules_TBari_ed
+binary_image_info_pattern = /^(?<load_address>0x\h+)\s-\s0x\h+\s(?<binary_name>[^\s]+)\s(?<arch>[^\s]+)\s+<(?<uuid>\h{32})>\s+(?<path_on_device>.*)/
+
+# Code Type:           ARM-64 (Native)
+system_architecture_pattern = /^Code Type:\s+(?<arch_name>\S+)\s*.*/
+
+# OS Version:          iPhone OS 12.5.6 (16H71)
+os_version_pattern = /^OS Version:\s+(?<name>.+)\s+\((?<id>\S+)\)/
+
+# Triggered by Thread:  0
+triggering_thread_pattern = /^Triggered by Thread:\s+(?<thread_num>\d+)/
 
 # States:
 # :Unkown
@@ -204,6 +273,8 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
                     :binary_name => matches[:binary_name],
                     :arch => matches[:arch],
                     :uuid => format_uuid( matches[:uuid] ),
+                    :path_on_device => matches[:path_on_device],
+                    :included_in_bundle => matches[:path_on_device].start_with?( "/var/containers" ),
                     :dsym_file => nil,
                     :dsym_file_lookup_done => false,
                     :bcsymbolmap => nil
@@ -218,16 +289,50 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
 
     if( state == :Unkown) then
         matched = false
-        line.match(thread_callstack_header_pattern) { |matches|
-            matched = true
-            callstacks.append(
-                {   :thread_num => matches[:thread_num].to_i,
-                    :crashed => matches[:extra].to_s.end_with?( "Crashed" ),
-                    :frames => []
+
+        if ( os_version == nil )
+            line.match(os_version_pattern) { |matches|
+                matched = true
+                os_version = {
+                    :name => matches[:name],
+                    :id => matches[:id]
                 }
-            )
-            state = :InThreadCallstack
-        }
+                print( "OS version: #{os_version[:name]}, #{os_version[:id]}\n" )
+            }
+        end
+
+        if ( system_architecture == nil )
+            line.match(system_architecture_pattern) { |matches|
+                matched = true
+                system_architecture = matches[:arch_name]
+                print( "Architecture: #{system_architecture}\n" )
+            }
+        end
+
+        if ( triggering_thread == nil )
+            line.match(triggering_thread_pattern) { |matches|
+                matched = true
+                triggering_thread = matches[:thread_num]
+                print( "Triggering thread: #{triggering_thread}\n" )
+            }
+        end
+
+        if ( os_version != nil && $system_symbols_path == nil )
+            $system_symbols_path = find_system_symbols_path( os_version )
+        end
+
+        if !matched
+            line.match(thread_callstack_header_pattern) { |matches|
+                matched = true
+                callstacks.append(
+                    {   :thread_num => matches[:thread_num].to_i,
+                        :crashed => matches[:extra].to_s.end_with?( "Crashed" ),
+                        :frames => []
+                    }
+                )
+                state = :InThreadCallstack
+            }
+        end
 
         if !matched then
             matched = false
@@ -242,6 +347,11 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
         end
     end
 end
+
+# binary_images.each do |image|
+#     print( "#{image[:binary_name]}\n  Path on device : #{ image[:path_on_device] }\n  Is in bundle   : #{ image[:included_in_bundle] }\n\n" )
+# end
+# exit (0)
 
 load_address_to_binary_image = {}
 binary_images.each do | image |
@@ -261,19 +371,16 @@ callstacks.each do | thread |
         binary_image = load_address_to_binary_image[ load_address ]
         update_dSYM_for_binary_image( binary_image, $config[:xcarchive] )
         if binary_image[:dsym_file] == nil then
-            print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{load_address} = #{frame[:address]} + #{frame[:offset]}\n" )
+            print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{frame[:address]} = #{load_address} + #{frame[:offset]}\n" )
         else
             address = frame[:address]
             dsym_loc = binary_image[ :dsym_file ]
             arch = binary_image[:arch]
             binary_name = binary_image[:binary_name]
             atos_command = "atos -arch #{arch} -o \"#{dsym_loc}\" -l #{load_address}  #{ address }\n"
+            # print( "ATOS COMMAND: [#{atos_command}]" )
             resolved, status = Open3.capture2( atos_command )
             print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{resolved.strip}\n" )
         end
     end
 end
-
-# binary_images.each do |image|
-#     print( "#{image[:binary_name]}\n  dSYM: #{image[:dsym_file]}\n  BCSM: #{image[:bcsymbolmap]}\n" )
-# end
