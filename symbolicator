@@ -16,6 +16,7 @@ $config = {
 }
 
 callstacks = []
+binary_image_to_frame_list = {}
 binary_images = []
 os_version = nil
 system_architecture = nil
@@ -123,6 +124,35 @@ def find_system_symbols_path( os_version )
         end
     end
     return nil
+end
+
+def run_atos_for_binary_image( binary_image, frame_list )
+    if( binary_image[:atos_executed] )
+        return
+    end
+
+    if binary_image[:dsym_file] != nil then
+        dsym_loc = binary_image[ :dsym_file ]
+        arch = binary_image[:arch]
+        binary_name = binary_image[:binary_name]
+
+        addresses = []
+        frame_list.each { |frame|
+            addresses.append( frame[:address] )
+        }
+        addresses_str = addresses.join( " " )
+        atos_command = "atos -arch #{arch} -o \"#{dsym_loc}\" -l #{binary_image[:load_address]}  #{ addresses_str }"
+        # print( "ATOS COMMAND: [#{atos_command}]\n" )
+        
+        resolved, status = Open3.capture2( atos_command )
+        resolved_strs = resolved.split( "\n" )
+
+        frame_list.each_with_index { |frame, idx|
+            frame[:resolved_str] = "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{resolved_strs[idx].strip}"
+        }
+    end
+
+    binary_image[:atos_executed] = true
 end
 
 def print_help()
@@ -249,14 +279,23 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
         matched = false
         line.match(callstack_frame_pattern) { |matches|
             matched = true
+
+            binary_name = matches[:binary_name]
             callstacks.last[:frames].append(
                 {   :frame_num => matches[:frame_num].to_i,
-                    :binary_name => matches[:binary_name],
+                    :binary_name => binary_name,
                     :address => matches[:address],
                     :load_address => matches[:load_address],
-                    :offset => matches[:offset]
+                    :offset => matches[:offset],
+                    :resolved_str => nil
                 }
             )
+
+            if( binary_image_to_frame_list.key?( binary_name) )
+                binary_image_to_frame_list[matches[:binary_name]].append( callstacks.last[:frames].last )
+            else
+                binary_image_to_frame_list[matches[:binary_name]] = [ callstacks.last[:frames].last ]
+            end
         }
 
         if !matched then
@@ -277,7 +316,8 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
                     :included_in_bundle => matches[:path_on_device].start_with?( "/var/containers" ),
                     :dsym_file => nil,
                     :dsym_file_lookup_done => false,
-                    :bcsymbolmap => nil
+                    :bcsymbolmap => nil,
+                    :atos_executed => false
                 }
             )
         }
@@ -348,17 +388,10 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
     end
 end
 
-# binary_images.each do |image|
-#     print( "#{image[:binary_name]}\n  Path on device : #{ image[:path_on_device] }\n  Is in bundle   : #{ image[:included_in_bundle] }\n\n" )
-# end
-# exit (0)
-
 load_address_to_binary_image = {}
 binary_images.each do | image |
     load_address_to_binary_image[ image[:load_address] ] = image
 end
-
-number_of_bins = binary_images.size
 
 callstacks.each do | thread |
     if !thread[:crashed] && $config[:only_crashed_thread] then
@@ -367,20 +400,14 @@ callstacks.each do | thread |
 
     print( "\nThread #{thread[:thread_num]} #{thread[:crashed] ? "(crashed)" : ""}\n" )
     thread[:frames].each do | frame |
-        load_address = frame[:load_address]
-        binary_image = load_address_to_binary_image[ load_address ]
+        binary_image = load_address_to_binary_image[ frame[:load_address] ]
         update_dSYM_for_binary_image( binary_image, $config[:xcarchive] )
-        if binary_image[:dsym_file] == nil then
-            print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{frame[:address]} = #{load_address} + #{frame[:offset]}\n" )
+        binary_name = binary_image[:binary_name]
+        run_atos_for_binary_image( binary_image, binary_image_to_frame_list[ binary_name ] )
+        if frame[:resolved_str] == nil then
+            print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{frame[:address]} = #{frame[:load_address]} + #{frame[:offset]}\n" )
         else
-            address = frame[:address]
-            dsym_loc = binary_image[ :dsym_file ]
-            arch = binary_image[:arch]
-            binary_name = binary_image[:binary_name]
-            atos_command = "atos -arch #{arch} -o \"#{dsym_loc}\" -l #{load_address}  #{ address }\n"
-            # print( "ATOS COMMAND: [#{atos_command}]" )
-            resolved, status = Open3.capture2( atos_command )
-            print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{resolved.strip}\n" )
+            print( "#{ frame[:resolved_str] }\n" )
         end
     end
 end
