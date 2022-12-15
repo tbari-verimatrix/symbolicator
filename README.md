@@ -5,6 +5,7 @@ This is a command line tool to resolve/symbolicate iOS crashlogs. The tool uses 
 ## Requirements
 * Ruby (developed and tested with 2.6.10)
 * `Open3` gem
+* `colorize` gem
 * Xcode installation (`dwarfdump`, `dsymutil`, `atos`, `mdfind`)
 
 ## Usage

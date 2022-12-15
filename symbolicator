@@ -4,6 +4,7 @@
 #  https://developer.apple.com/documentation/xcode/adding-identifiable-symbol-names-to-a-crash-report
 
 require 'open3'
+require 'colorize'
 
 $config = {
     :crashlog => "",
@@ -11,6 +12,7 @@ $config = {
     :only_crashed_thread => false,
     :auto_symbolicate => false,
     :no_system_libs => false,
+    :no_colors => false,
     :verbose => false,
     :help => false
 }
@@ -167,6 +169,7 @@ Usage:
       -c, --only-crashed      : Show the callstack of the crashed thread only.
       -n, --no-system-libs    : Don't resolve frames for binaries that are
                                 not part of the application bundle.
+      -d, --disable-colors    : Don't colorise output.
       -v, --verbose           : Print additional info (for now, the configuration)
       -h, --help              : Show this message.
 " )
@@ -203,6 +206,9 @@ def parse_arguments( argv )
             idx += 1
         elsif argv[idx] == "-n" || argv[idx] == "--no-system-libs" then
             $config[:no_system_libs] = true
+            idx += 1
+        elsif argv[idx] == "-d" || argv[idx] == "--disable-colors" then
+            $config[:no_colors] = true
             idx += 1
         elsif argv[idx] == "-v" || argv[idx] == "--verbose" then
             $config[:verbose] = true
@@ -245,6 +251,8 @@ if $config[:help] then
     print_help()
     exit 0
 end
+
+String.disable_colorization = $config[:no_colors]
 
 # Thread 0 Crashed:
 # Thread 1:
@@ -405,9 +413,15 @@ callstacks.each do | thread |
         binary_name = binary_image[:binary_name]
         run_atos_for_binary_image( binary_image, binary_image_to_frame_list[ binary_name ] )
         if frame[:resolved_str] == nil then
-            print( "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{frame[:address]} = #{frame[:load_address]} + #{frame[:offset]}\n" )
+            output = "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{frame[:address]} = #{frame[:load_address]} + #{frame[:offset]}"
         else
-            print( "#{ frame[:resolved_str] }\n" )
+            output = "#{ frame[:resolved_str] }"
+        end
+
+        if binary_image[:included_in_bundle]
+            print( "#{output}\n".green )
+        else
+            print( "#{output}\n".colorize(:color => :default, :background => :default) )
         end
     end
 end
