@@ -17,12 +17,6 @@ $config = {
     :help => false
 }
 
-callstacks = []
-binary_image_to_frame_list = {}
-binary_images = []
-os_version = nil
-system_architecture = nil
-triggering_thread = nil
 $system_symbols_path = nil
 
 def format_uuid( raw_uuid )
@@ -35,7 +29,7 @@ def format_uuid( raw_uuid )
     return (part1 + "-" + part2 + "-" + part3 + "-" + part4 + "-" + part5)
 end
 
-def update_dSYM_for_system_lib( binary_image )
+def update_dsym_for_system_lib( binary_image )
     if( $config[:no_system_libs] || $system_symbols_path == nil )
         return
     end
@@ -46,59 +40,60 @@ def update_dSYM_for_system_lib( binary_image )
     end
 end
 
-def select_dSYM_for_binary( xcarchive_dir, binary_name, uuid )
-    options = Dir.glob( xcarchive_dir + "/dSYMs/*" ).select { |e| e.match(/.*\/dSYMs\/#{binary_name}.*\.dSYM/) }
-    options.each do |option|
+def select_dsym_for_binary( xcarchive_dir, binary_name, uuid )
+    options = Dir.glob( File.join( xcarchive_dir, "dSYMs", "*" ) ).select { |e|
+        e.match(/.*\/dSYMs\/#{binary_name}.*\.dSYM/)
+    }
+    options.each { |option|
         if File::exist?(option + "/Contents/Resources/DWARF/#{binary_name}") then
             output, state = Open3.capture2( "dwarfdump -uuid \"#{option}\"" )
             if output.match(/#{uuid}/) then
                 return option
             end
         end
-    end
+    }
     return nil
  end
 
-def update_dSYM_for_binary_image( binary_image, preferred_xcarchive )
-
-    if binary_image[:dsym_file_lookup_done] then
+def update_dsym_for_binary_image( binary_image, preferred_xcarchive )
+    if( binary_image[:dsym_file_lookup_done] )
         return
     end
 
     if( !binary_image[:included_in_bundle] ) # it's a system lib
-        update_dSYM_for_system_lib(binary_image)
+        update_dsym_for_system_lib(binary_image)
         binary_image[:dsym_file_lookup_done] = true
         return
     end
 
-    if preferred_xcarchive == nil then
+    if( preferred_xcarchive == nil )
         options, status = Open3.capture2( "mdfind \"com_apple_xcode_dsym_uuids == #{binary_image[:uuid]}\"" )
     else
         options = preferred_xcarchive
     end
 
     success = false
-    options.split("\n").each do |option|
-        result = select_dSYM_for_binary( option, binary_image[:binary_name], binary_image[:uuid] )
-        if result != nil then
+    options.split("\n").each { |option|
+        result = select_dsym_for_binary( option, binary_image[:binary_name], binary_image[:uuid] )
+        if( result != nil )
             binary_image[:dsym_file] = result
             success = true
 
-            bcsymbolmap_file = option + "/BCSymbolMaps/#{binary_image[:uuid]}.bcsymbolmap"
-            if File.exist?( bcsymbolmap_file ) then
+            bcsymbolmap_file = File.join( option, "BCSymbolMaps", "#{binary_image[:uuid]}.bcsymbolmap" )
+            if( File.exist?( bcsymbolmap_file ) )
                 binary_image[:bcsymbolmap] = bcsymbolmap_file
 
-                if $config[:auto_symbolicate] then
+                if( $config[:auto_symbolicate] )
                     Open3.capture2( "dsymutil -symbol-map \"#{bcsymbolmap_file}\" \"#{result}\"" )
                 end
             end
 
             break
         end
-    end
+    }
 
-    if !success && preferred_xcarchive != nil then
-        update_dSYM_for_binary_image( binary_image, nil ) # retry with spotlight search
+    if( !success && preferred_xcarchive != nil )
+        update_dsym_for_binary_image( binary_image, nil ) # retry with spotlight search
     end
 
     binary_image[:dsym_file_lookup_done] = true
@@ -106,7 +101,7 @@ end
 
 def find_system_symbols_path( os_version )
     device_support_dir_name = nil
-    if ( os_version[:name].include?( "iPhone OS" ) )
+    if( os_version[:name].include?( "iPhone OS" ) )
         device_support_dir_name = "iOS DeviceSupport"
     else
         print( "OS version not supported yet: #{ os_version[:name] }" );
@@ -118,13 +113,15 @@ def find_system_symbols_path( os_version )
         return nil
     end
 
-    options = Dir.glob( File.join( xcode_data_path, "*" ) ).select { |e| e.match(/.*#{os_version[:id]}.*/) }
-    options.each do |option|
+    options = Dir.glob( File.join( xcode_data_path, "*" ) ).select { |e|
+        e.match(/.*#{os_version[:id]}.*/)
+    }
+    options.each { |option|
         candidate = File.join( option, "Symbols" )
         if( Dir.exist?( candidate ) )
             return candidate
         end
-    end
+    }
     return nil
 end
 
@@ -133,7 +130,7 @@ def run_atos_for_binary_image( binary_image, frame_list )
         return
     end
 
-    if binary_image[:dsym_file] != nil then
+    if( binary_image[:dsym_file] != nil )
         dsym_loc = binary_image[ :dsym_file ]
         arch = binary_image[:arch]
         binary_name = binary_image[:binary_name]
@@ -144,8 +141,6 @@ def run_atos_for_binary_image( binary_image, frame_list )
         }
         addresses_str = addresses.join( " " )
         atos_command = "atos -arch #{arch} -o \"#{dsym_loc}\" -l #{binary_image[:load_address]}  #{ addresses_str }"
-        # print( "ATOS COMMAND: [#{atos_command}]\n" )
-        
         resolved, status = Open3.capture2( atos_command )
         resolved_strs = resolved.split( "\n" )
 
@@ -176,47 +171,46 @@ Usage:
 end
 
 def parse_arguments( argv )
-
-    if argv.size < 1 then
+    if( argv.size < 1 )
         puts( "No argument(s) given!" )
         return false
     end
 
-    if argv[0] == "-h" || argv[0] == "--help" then
+    if( argv[0] == "-h" || argv[0] == "--help" )
         $config[:help] = true
         return true
     end
 
-    if !File.readable?( argv[0] ) then
+    if( !File.readable?( argv[0] ) )
         print( "Input file [#{argv[0]}] is not readable!\n" )
         return false
     end
     $config[:crashlog] = argv[0]
 
     idx = 1
-    while idx < argv.size() do
-        if argv[idx] == "-c" || argv[idx] == "--only-crashed" then
+    while( idx < argv.size() )
+        if( argv[idx] == "-c" || argv[idx] == "--only-crashed" )
             $config[:only_crashed_thread] = true
             idx += 1
-        elsif argv[idx] == "-h" || argv[idx] == "--help" then
+        elsif( argv[idx] == "-h" || argv[idx] == "--help" )
             $config[:help] = true
             idx += 1
-        elsif argv[idx] == "-a" || argv[idx] == "--auto-symbolicate" then
+        elsif( argv[idx] == "-a" || argv[idx] == "--auto-symbolicate" )
             $config[:auto_symbolicate] = true
             idx += 1
-        elsif argv[idx] == "-n" || argv[idx] == "--no-system-libs" then
+        elsif( argv[idx] == "-n" || argv[idx] == "--no-system-libs" )
             $config[:no_system_libs] = true
             idx += 1
-        elsif argv[idx] == "-d" || argv[idx] == "--disable-colors" then
+        elsif( argv[idx] == "-d" || argv[idx] == "--disable-colors" )
             $config[:no_colors] = true
             idx += 1
-        elsif argv[idx] == "-v" || argv[idx] == "--verbose" then
+        elsif( argv[idx] == "-v" || argv[idx] == "--verbose" )
             $config[:verbose] = true
             idx += 1
-        elsif argv[idx] == "-x" then
+        elsif( argv[idx] == "-x" )
             possible_path = ( idx + 1 ) < argv.size() ? argv[ idx + 1 ] : ""
-            if !possible_path.empty? then
-                if Dir.exist?( possible_path ) then
+            if( !possible_path.empty? )
+                if( Dir.exist?( possible_path ) )
                     $config[:xcarchive] = possible_path
                 else
                     print( "Xcarchive path cannot be found: #{ possible_path }\n" )
@@ -235,19 +229,29 @@ def parse_arguments( argv )
     return true
 end
 
-if !parse_arguments( ARGV ) then
+###############################################################################
+### main
+
+callstacks = []
+binary_image_to_frame_list = {}
+binary_images = []
+os_version = nil
+system_architecture = nil
+triggering_thread = nil
+
+if( !parse_arguments( ARGV ) )
     print_help()
     exit 1
 end
 
-if $config[:verbose] then
+if( $config[:verbose] )
     $config.each { |key, value|
         print( "#{key} : #{value}\n" );
     }
     puts( "" )
 end
 
-if $config[:help] then
+if( $config[:help] )
     print_help()
     exit 0
 end
@@ -281,13 +285,12 @@ triggering_thread_pattern = /^Triggered by Thread:\s+(?<thread_num>\d+)/
 # :InThreadCallstack
 # :InBinaryImageList
 state = :Unkown
-crashlog = File.readlines( $config[:crashlog] ).each do | line |
+crashlog = File.readlines( $config[:crashlog] ).each { | line |
 
-    if( state == :InThreadCallstack ) then
+    if( state == :InThreadCallstack )
         matched = false
         line.match(callstack_frame_pattern) { |matches|
             matched = true
-
             binary_name = matches[:binary_name]
             callstacks.last[:frames].append(
                 {   :frame_num => matches[:frame_num].to_i,
@@ -306,12 +309,12 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
             end
         }
 
-        if !matched then
+        if( !matched )
             state = :Unkown
         end
     end
 
-    if( state == :InBinaryImageList ) then
+    if( state == :InBinaryImageList )
         matched = false
         line.match(binary_image_info_pattern) { |matches|
             matched = true
@@ -330,15 +333,15 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
             )
         }
 
-        if !matched then
+        if( !matched )
             state = :Unkown
         end
     end
 
-    if( state == :Unkown) then
+    if( state == :Unkown )
         matched = false
 
-        if ( os_version == nil )
+        if( os_version == nil )
             line.match(os_version_pattern) { |matches|
                 matched = true
                 os_version = {
@@ -349,7 +352,7 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
             }
         end
 
-        if ( system_architecture == nil )
+        if( system_architecture == nil )
             line.match(system_architecture_pattern) { |matches|
                 matched = true
                 system_architecture = matches[:arch_name]
@@ -357,7 +360,7 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
             }
         end
 
-        if ( triggering_thread == nil )
+        if( triggering_thread == nil )
             line.match(triggering_thread_pattern) { |matches|
                 matched = true
                 triggering_thread = matches[:thread_num]
@@ -365,11 +368,11 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
             }
         end
 
-        if ( os_version != nil && $system_symbols_path == nil )
+        if( os_version != nil && $system_symbols_path == nil )
             $system_symbols_path = find_system_symbols_path( os_version )
         end
 
-        if !matched
+        if( !matched )
             line.match(thread_callstack_header_pattern) { |matches|
                 matched = true
                 callstacks.append(
@@ -382,46 +385,46 @@ crashlog = File.readlines( $config[:crashlog] ).each do | line |
             }
         end
 
-        if !matched then
+        if( !matched )
             matched = false
             line.match(binary_images_start_pattern) { |matches|
                 matched = true
                 state = :InBinaryImageList
             }
 
-            if !matched then
+            if( !matched )
                 state = :Unkown
             end
         end
     end
-end
+}
 
 load_address_to_binary_image = {}
-binary_images.each do | image |
+binary_images.each { |image|
     load_address_to_binary_image[ image[:load_address] ] = image
-end
+}
 
-callstacks.each do | thread |
-    if !thread[:crashed] && $config[:only_crashed_thread] then
+callstacks.each { |thread|
+    if( !thread[:crashed] && $config[:only_crashed_thread] )
         next
     end
 
     print( "\nThread #{thread[:thread_num]} #{thread[:crashed] ? "(crashed)" : ""}\n" )
-    thread[:frames].each do | frame |
+    thread[:frames].each { |frame|
         binary_image = load_address_to_binary_image[ frame[:load_address] ]
-        update_dSYM_for_binary_image( binary_image, $config[:xcarchive] )
+        update_dsym_for_binary_image( binary_image, $config[:xcarchive] )
         binary_name = binary_image[:binary_name]
         run_atos_for_binary_image( binary_image, binary_image_to_frame_list[ binary_name ] )
-        if frame[:resolved_str] == nil then
+        if( frame[:resolved_str] == nil )
             output = "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{frame[:address]} = #{frame[:load_address]} + #{frame[:offset]}"
         else
             output = "#{ frame[:resolved_str] }"
         end
 
-        if binary_image[:included_in_bundle]
+        if( binary_image[:included_in_bundle] )
             print( "#{output}\n".green )
         else
             print( "#{output}\n".colorize(:color => :default, :background => :default) )
         end
-    end
-end
+    }
+}
