@@ -101,7 +101,7 @@ end
 
 def find_system_symbols_path( os_version )
     device_support_dir_name = nil
-    if( os_version[:name].include?( "iPhone OS" ) )
+    if( os_version[:name].include?( "iPhone OS" ) or os_version[:name].include?( "iOS" ) )
         device_support_dir_name = "iOS DeviceSupport"
     else
         print( "OS version not supported yet: #{ os_version[:name] }" );
@@ -263,7 +263,9 @@ String.disable_colorization = $config[:no_colors]
 thread_callstack_header_pattern = /^Thread\s+(?<thread_num>\d+)(?<extra>\sCrashed)?:$/
 
 # 5   Molecules_TBari_ed            	0x000000010134455c 0x101324000 + 132444
+# 13  UIKitCore                      	 0x0000000193247484 UIApplicationMain (UIKitCore)
 callstack_frame_pattern = /^(?<frame_num>\d+)\s+(?<binary_name>[\w\.]+)\s+(?<address>0x\h+)\s+(?<load_address>0x\h+)\s\+\s(?<offset>\d+)/
+callstack_frame_pattern_already_resolved = /^(?<frame_num>\d+)\s+(?<binary_name>[\w\.]+)\s+(?<address>0x\h+)\s+(?<symbol>.+)/
 
 # Binary Images:
 binary_images_start_pattern = /Binary\sImages:/
@@ -308,6 +310,23 @@ crashlog = File.readlines( $config[:crashlog] ).each { | line |
                 binary_image_to_frame_list[matches[:binary_name]] = [ callstacks.last[:frames].last ]
             end
         }
+        
+        if( !matched )
+            line.match(callstack_frame_pattern_already_resolved) { |matches|
+                matched = true
+                binary_name = matches[:binary_name]
+                callstacks.last[:frames].append(
+                    {   :frame_num => matches[:frame_num].to_i,
+                        :binary_name => binary_name,
+                        :address => matches[:address],
+                        :load_address => 0x0,
+                        :offset => 0x0,
+                        # :resolved_str => matches[:symbol]
+                        :resolved_str => "  #{ "%5d" % matches[:frame_num].to_i } #{ "%30s" % binary_name }    #{ matches[:symbol] }"
+                    }
+                )
+            }
+        end
 
         if( !matched )
             state = :Unkown
@@ -324,7 +343,7 @@ crashlog = File.readlines( $config[:crashlog] ).each { | line |
                     :arch => matches[:arch],
                     :uuid => format_uuid( matches[:uuid] ),
                     :path_on_device => matches[:path_on_device],
-                    :included_in_bundle => matches[:path_on_device].start_with?( "/var/containers" ),
+                    :included_in_bundle => matches[:path_on_device].start_with?( "/var/containers" ) || matches[:path_on_device].start_with?( "/private/var/containers" ),
                     :dsym_file => nil,
                     :dsym_file_lookup_done => false,
                     :bcsymbolmap => nil,
@@ -400,8 +419,10 @@ crashlog = File.readlines( $config[:crashlog] ).each { | line |
 }
 
 load_address_to_binary_image = {}
+binary_name_to_binary_image = {}
 binary_images.each { |image|
     load_address_to_binary_image[ image[:load_address] ] = image
+    binary_name_to_binary_image[ image[:binary_name] ] = image
 }
 
 callstacks.each { |thread|
@@ -411,7 +432,21 @@ callstacks.each { |thread|
 
     print( "\nThread #{thread[:thread_num]} #{thread[:crashed] ? "(crashed)" : ""}\n" )
     thread[:frames].each { |frame|
+        if( frame[:binary_name].strip() == "" )
+            output = "  #{ "%5d" % frame[:frame_num] } #{ "%30s" % binary_image[:binary_name] }    #{frame[:address]} = #{frame[:load_address]} + #{frame[:offset]}"
+            print( "#{output}\n".colorize(:color => :default, :background => :default) )
+            next
+        end
+
         binary_image = load_address_to_binary_image[ frame[:load_address] ]
+        if( binary_image == nil )
+            binary_image = binary_name_to_binary_image[ frame[:binary_name] ]
+        end
+        if( binary_image == nil )
+            output = "  #{ "%5d" % frame[:frame_num] } Error: Failed to get binary image!"
+            print( "#{output}\n".colorize(:color => :default, :background => :default) )
+            next
+        end
         update_dsym_for_binary_image( binary_image, $config[:xcarchive] )
         binary_name = binary_image[:binary_name]
         run_atos_for_binary_image( binary_image, binary_image_to_frame_list[ binary_name ] )
